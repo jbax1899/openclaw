@@ -1063,6 +1063,25 @@ export function createDiagnosticsPrometheusExporter(pluginConfig?: unknown) {
           privateServer = undefined;
           server.off("error", onError);
           await closeServer(server).catch(() => undefined);
+          unsubscribe?.();
+          unsubscribe = undefined;
+          reportExporterHealth({
+            signal: "metrics",
+            transport: "prometheus-scrape",
+            status: "dropped",
+          });
+          try {
+            internalDiagnostics?.emit({
+              type: "telemetry.exporter",
+              exporter: "diagnostics-prometheus",
+              signal: "metrics",
+              status: "dropped",
+            });
+          } catch {
+            // Startup failure must preserve the bind error and never leak the subscription.
+          }
+          internalDiagnostics = undefined;
+          store.reset();
           throw error;
         });
       }

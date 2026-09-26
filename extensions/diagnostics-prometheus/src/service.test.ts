@@ -106,6 +106,9 @@ describe("diagnostics-prometheus service", () => {
     try {
       await owner.start();
       await expect(contender.start()).rejects.toMatchObject({ code: "EADDRINUSE" });
+      expect(() => contender.record(baseEvent(), trusted)).toThrow(
+        "Prometheus diagnostics listener",
+      );
     } finally {
       await contender.stop();
       await owner.stop();
