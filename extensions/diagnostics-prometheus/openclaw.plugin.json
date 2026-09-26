@@ -9,6 +9,33 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {}
+    "properties": {
+      "gatewayRoute": {
+        "type": "boolean",
+        "default": true
+      },
+      "privateListener": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["port"],
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "default": "0.0.0.0"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^/[^?#]*$",
+            "default": "/metrics"
+          }
+        }
+      }
+    }
   }
 }

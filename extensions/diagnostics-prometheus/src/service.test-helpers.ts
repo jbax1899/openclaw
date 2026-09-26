@@ -30,8 +30,10 @@ export function createMetricsHarness(
     OpenClawPluginServiceContext["internalDiagnostics"]
   >["getRuntimeIdentity"],
   config: OpenClawPluginServiceContext["config"] = {},
+  pluginConfig?: unknown,
+  autoStart = true,
 ) {
-  const exporter = createDiagnosticsPrometheusExporter();
+  const exporter = createDiagnosticsPrometheusExporter(pluginConfig);
   let listener:
     | ((
         event: DiagnosticEventPayload,
@@ -62,7 +64,9 @@ export function createMetricsHarness(
     internalDiagnostics,
   };
   const start = () => exporter.service.start(context);
-  start();
+  if (autoStart) {
+    void start();
+  }
   return {
     handler: exporter.handler,
     record(event: DiagnosticEventPayload, metadata: DiagnosticEventMetadata) {

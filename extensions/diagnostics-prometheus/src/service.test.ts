@@ -2,6 +2,10 @@ import { createServer } from "node:http";
 import { expectDefined } from "@openclaw/normalization-core";
 import type { DiagnosticEventPrivateData } from "openclaw/plugin-sdk/diagnostic-runtime";
 import { describe, expect, it, vi } from "vitest";
+import {
+  acquireTestPortBlock,
+  reserveTestPortListener,
+} from "../../../src/test-utils/port-claims.js";
 import type { DiagnosticEventMetadata, DiagnosticEventPayload } from "../api.js";
 import { createDiagnosticsPrometheusExporter } from "./service.js";
 import {
@@ -13,6 +17,8 @@ import {
   type TrustedExporterInternalDiagnostics,
 } from "./service.test-helpers.js";
 
+/* oxlint-disable max-lines -- exporter behavior and lifecycle coverage share one suite. */
+
 // HTTP scrapes here exercise an authorized operator; the exporter's scope guard is covered by
 // service.http-scope.test.ts.
 vi.mock("openclaw/plugin-sdk/plugin-runtime", () => ({
@@ -22,6 +28,100 @@ vi.mock("openclaw/plugin-sdk/plugin-runtime", () => ({
 }));
 
 describe("diagnostics-prometheus service", () => {
+  it("serves the same registry on a configured private listener and closes it on stop", async () => {
+    const claim = await acquireTestPortBlock({ offsets: [0] });
+
+    const metrics = createMetricsHarness(
+      undefined,
+      {},
+      {
+        gatewayRoute: false,
+        privateListener: { host: "127.0.0.1", port: claim.port, path: "/metrics" },
+      },
+      false,
+    );
+    let claimReleased = false;
+    let stopped = false;
+    const releaseClaim = async () => {
+      if (!claimReleased) {
+        claimReleased = true;
+        await claim.release();
+      }
+    };
+    const stop = async () => {
+      if (!stopped) {
+        stopped = true;
+        await metrics.stop();
+      }
+    };
+    try {
+      await metrics.start();
+      await releaseClaim();
+      metrics.record(
+        {
+          ...baseEvent(),
+          type: "model.usage",
+          provider: "openai",
+          model: "gpt-5.4",
+          usage: { input: 12 },
+        },
+        trusted,
+      );
+
+      const response = await fetch(`http://127.0.0.1:${claim.port}/metrics`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(metrics.render());
+      const other = await fetch(`http://127.0.0.1:${claim.port}/other`);
+      expect(other.status).toBe(404);
+      await other.text();
+
+      await stop();
+      await expect(fetch(`http://127.0.0.1:${claim.port}/metrics`)).rejects.toThrow();
+    } finally {
+      await stop();
+      await releaseClaim();
+    }
+  });
+
+  it("cleans up a private listener after a port-in-use startup failure", async () => {
+    const ownerReservation = await reserveTestPortListener({
+      offsets: [0],
+      createListener: () => createServer(),
+    });
+    const port = ownerReservation.claim.port;
+    const owner = createMetricsHarness(
+      undefined,
+      {},
+      { privateListener: { host: "127.0.0.1", port, path: "/metrics" } },
+      false,
+    );
+    const contender = createMetricsHarness(
+      undefined,
+      {},
+      { privateListener: { host: "127.0.0.1", port, path: "/metrics" } },
+      false,
+    );
+
+    await ownerReservation.releaseListener();
+    try {
+      await owner.start();
+      await expect(contender.start()).rejects.toMatchObject({ code: "EADDRINUSE" });
+    } finally {
+      await contender.stop();
+      await owner.stop();
+      await ownerReservation.claim.release();
+    }
+
+    const recovered = createMetricsHarness(
+      undefined,
+      {},
+      { privateListener: { host: "127.0.0.1", port, path: "/metrics" } },
+      false,
+    );
+    await recovered.start();
+    await recovered.stop();
+  });
+
   it("records Gateway RPC timings by method and outcomes without method multiplication", () => {
     const metrics = createMetricsHarness();
     const base = {
@@ -69,7 +169,7 @@ describe("diagnostics-prometheus service", () => {
     );
     expect(rendered).not.toContain(base.trace.traceId);
     expect(rendered).not.toMatch(/openclaw_gateway_rpc_outcomes_total\{[^\n]*method=/);
-    metrics.stop();
+    void metrics.stop();
   });
 
   it("keeps rejected and unsent RPC observations out of response and handler timings", () => {
@@ -103,7 +203,7 @@ describe("diagnostics-prometheus service", () => {
     for (const metric of ["first_response", "handler", "admission", "queue_wait"]) {
       expect(rendered).not.toContain(`openclaw_gateway_rpc_${metric}_seconds`);
     }
-    metrics.stop();
+    void metrics.stop();
   });
 
   it("records trusted run metrics without raw diagnostic identifiers", () => {
@@ -844,7 +944,7 @@ describe("diagnostics-prometheus service", () => {
     metrics.record({ ...queue, lane: "later" }, trusted);
     expect(metrics.render()).toContain("openclaw_prometheus_series_dropped_total 89");
     expect(metrics.render()).not.toContain('lane="later"');
-    metrics.stop();
+    void metrics.stop();
   });
 
   it("caps metric series growth and reports dropped series", () => {
@@ -876,10 +976,10 @@ describe("diagnostics-prometheus service", () => {
     const saturated = metrics.render();
     expect(saturated).not.toContain("openclaw_gateway_rpc_requests_total");
     expect(saturated).not.toBe(rendered);
-    metrics.stop();
+    void metrics.stop();
   });
 
-  it("subscribes to internal diagnostics and renders scrape text", () => {
+  it("subscribes to internal diagnostics and renders scrape text", async () => {
     const listeners: Array<
       (
         event: DiagnosticEventPayload,
@@ -893,7 +993,7 @@ describe("diagnostics-prometheus service", () => {
     const exporter = createDiagnosticsPrometheusExporter();
     const unsubscribe = vi.fn();
 
-    exporter.service.start({
+    await exporter.service.start({
       config: {} as never,
       stateDir: "/tmp/openclaw-prometheus-test",
       logger: {
@@ -971,7 +1071,7 @@ describe("diagnostics-prometheus service", () => {
       `diagnostics-prometheus: event handler failed (model.usage): ${prefix}`,
     );
 
-    exporter.service.stop?.();
+    await exporter.service.stop?.();
 
     expect(unsubscribe).toHaveBeenCalledOnce();
     expect(emitted.at(-1)).toStrictEqual({
@@ -1034,7 +1134,7 @@ describe("metrics HTTP handler", () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
-      metrics.stop();
+      await metrics.stop();
     }
   });
 });

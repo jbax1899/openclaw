@@ -1,5 +1,5 @@
 // Diagnostics Prometheus plugin module implements service behavior.
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   isDiagnosticsEnabled,
   normalizeDiagnosticValue,
@@ -15,6 +15,7 @@ import type {
   OpenClawPluginService,
 } from "../api.js";
 import { isInternalDiagnosticEventMetadata, redactSensitiveText } from "../api.js";
+import { resolveDiagnosticsPrometheusConfig } from "./config.js";
 import {
   escapeHelp,
   formatLabelEntry,
@@ -893,11 +894,14 @@ function hasMetricsReadScope(): boolean {
   return METRICS_READ_IMPLYING_SCOPES.some((scope) => scopes.includes(scope));
 }
 
-function createMetricsHandler(store: PrometheusMetricStore): OpenClawPluginHttpRouteHandler {
+function createMetricsHandler(
+  store: PrometheusMetricStore,
+  options?: { requireScope?: boolean },
+): OpenClawPluginHttpRouteHandler {
   return (req: IncomingMessage, res: ServerResponse) => {
     // Fail closed before any metric rendering, including for HEAD probes that would
     // otherwise disclose the document size to an unauthorized caller.
-    if (!hasMetricsReadScope()) {
+    if (options?.requireScope !== false && !hasMetricsReadScope()) {
       res.statusCode = 403;
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -926,6 +930,34 @@ function createMetricsHandler(store: PrometheusMetricStore): OpenClawPluginHttpR
   };
 }
 
+function createPrivateMetricsHandler(
+  store: PrometheusMetricStore,
+  path: string,
+): OpenClawPluginHttpRouteHandler {
+  const handler = createMetricsHandler(store, { requireScope: false });
+  return (req, res) => {
+    let pathname: string | undefined;
+    try {
+      pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    } catch {
+      pathname = undefined;
+    }
+    if (pathname !== path) {
+      res.statusCode = 404;
+      res.end("Not Found");
+      return true;
+    }
+    return handler(req, res);
+  };
+}
+
+function closeServer(server: Server): Promise<void> {
+  server.closeIdleConnections();
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
 type PrometheusExporterHealthUpdate = {
   signal: "metrics";
   transport: "prometheus-scrape";
@@ -943,10 +975,12 @@ type TrustedExporterDiagnosticsBridge = {
   reportExporterHealth?: (update: PrometheusExporterHealthUpdate) => void;
 };
 
-export function createDiagnosticsPrometheusExporter() {
+export function createDiagnosticsPrometheusExporter(pluginConfig?: unknown) {
   const store = createPrometheusMetricStore();
+  const config = resolveDiagnosticsPrometheusConfig(pluginConfig);
   let unsubscribe: (() => void) | undefined;
   let internalDiagnostics: TrustedExporterDiagnosticsBridge | undefined;
+  let privateServer: { server: Server; onError: (error: unknown) => void } | undefined;
   const reportExporterHealth = (update: PrometheusExporterHealthUpdate) => {
     try {
       internalDiagnostics?.reportExporterHealth?.(update);
@@ -957,7 +991,7 @@ export function createDiagnosticsPrometheusExporter() {
 
   const service = {
     id: "diagnostics-prometheus",
-    start(ctx) {
+    async start(ctx) {
       const subscribe = ctx.internalDiagnostics?.onEvent;
       if (!subscribe) {
         ctx.logger.error("diagnostics-prometheus: internal diagnostics capability unavailable");
@@ -1006,8 +1040,36 @@ export function createDiagnosticsPrometheusExporter() {
         status: "started",
         reason: "configured",
       });
+
+      const listener = config.privateListener;
+      if (listener) {
+        const handler = createPrivateMetricsHandler(store, listener.path);
+        const server = createServer((req, res) => {
+          void handler(req, res);
+        });
+        const onError = (error: unknown) => {
+          ctx.logger.error(
+            `diagnostics-prometheus: private listener failed (${safeErrorMessage(error)})`,
+          );
+          ctx.serviceHealth?.reportFailure(error);
+        };
+        server.on("error", onError);
+        privateServer = { server, onError };
+        await new Promise<void>((resolve, reject) => {
+          server.once("listening", resolve);
+          server.once("error", reject);
+          server.listen({ host: listener.host, port: listener.port });
+        }).catch(async (error: unknown) => {
+          privateServer = undefined;
+          server.off("error", onError);
+          await closeServer(server).catch(() => undefined);
+          throw error;
+        });
+      }
     },
     stop() {
+      const activePrivateServer = privateServer;
+      privateServer = undefined;
       unsubscribe?.();
       unsubscribe = undefined;
       reportExporterHealth({
@@ -1023,6 +1085,12 @@ export function createDiagnosticsPrometheusExporter() {
       });
       internalDiagnostics = undefined;
       store.reset();
+      if (activePrivateServer) {
+        return closeServer(activePrivateServer.server).finally(() => {
+          activePrivateServer.server.off("error", activePrivateServer.onError);
+        });
+      }
+      return undefined;
     },
   } satisfies OpenClawPluginService;
 

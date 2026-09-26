@@ -21,8 +21,49 @@ Content type is `text/plain; version=0.0.4; charset=utf-8`, the standard
 Prometheus exposition format.
 
 <Warning>
-The route uses Gateway authentication (operator scope, trusted-operator surface) and requires the caller's effective scopes to include `operator.read` (implied by `operator.write` or `operator.admin`). Do not expose it as a public unauthenticated `/metrics` endpoint. Scrape it through the same auth path you use for other operator APIs.
+The Gateway route uses Gateway authentication (operator scope, trusted-operator surface) and requires the caller's effective scopes to include `operator.read` (implied by `operator.write` or `operator.admin`). Do not expose it as a public unauthenticated `/metrics` endpoint. Scrape it through the same auth path you use for other operator APIs.
 </Warning>
+
+## Private listener
+
+For Fly custom metrics or another private scraper, configure the plugin's
+explicit private listener. It serves the same registry without Gateway
+authentication, so bind it only to a private network boundary and do not add
+its port to a public `[[services]]` entry.
+
+```json5
+{
+  plugins: {
+    entries: {
+      "diagnostics-prometheus": {
+        enabled: true,
+        config: {
+          gatewayRoute: false,
+          privateListener: {
+            host: "0.0.0.0",
+            port: 9091,
+            path: "/metrics",
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+The listener starts and stops with the plugin service. It accepts only `GET`
+and `HEAD` requests for the configured path. Fly scrapes custom metrics every
+15 seconds when this declaration is present in `fly.toml`:
+
+```toml
+[[metrics]]
+  port = 9091
+  path = "/metrics"
+  processes = ["app"]
+```
+
+The default Gateway route remains enabled unless `gatewayRoute` is set to
+`false`.
 
 For traces, logs, OTLP push, and OpenTelemetry GenAI semantic attributes, see [OpenTelemetry export](/gateway/opentelemetry).
 
