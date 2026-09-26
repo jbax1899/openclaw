@@ -193,6 +193,82 @@ jobs:
             done < <(find "$state_dir" -type f \( -iname '*.log' -o -iname '*.err' -o -iname '*.error' \) -print0 2>/dev/null)
           }
 
+          fail_runtime_check() {
+            local name="$1"
+            local state_dir="$2"
+            local message="$3"
+            echo "::error::$message"
+            dump_gateway_failure "$name" "$state_dir"
+            return 1
+          }
+
+          print_response() {
+            local label="$1"
+            local headers="$2"
+            local body="$3"
+            local content_type
+            local bytes
+
+            content_type="$(grep -i -m1 '^Content-Type:' "$headers" | sed 's/^[^:]*:[[:space:]]*//' || true)"
+            bytes=0
+            if [ -f "$body" ]; then
+              bytes="$(wc -c < "$body" | tr -d ' ')"
+            fi
+            echo "$label content_type=${content_type:-<none>} bytes=$bytes"
+            echo "$label body="
+            redact_fixture_secret < "$body" | sed -n '1,40p'
+          }
+
+          check_metrics_endpoint() {
+            local name="$1"
+            local port="$2"
+            local state_dir="$3"
+            local label="$4"
+            local prefix="$RUNNER_TEMP/${label}-metrics"
+            local body="$prefix.body"
+            local headers="$prefix.headers"
+            local errors="$prefix.errors"
+            local status
+            local curl_code
+
+            : > "$body"
+            : > "$headers"
+            : > "$errors"
+            set +e
+            status="$(curl --silent --show-error \
+              --dump-header "$headers" \
+              --output "$body" \
+              --write-out '%{http_code}' \
+              "http://127.0.0.1:$port/metrics" 2>"$errors")"
+            curl_code=$?
+            set -e
+
+            echo "$label curl_exit=$curl_code status=${status:-<none>}"
+            print_response "$label" "$headers" "$body"
+            if [ -s "$errors" ]; then
+              echo "$label stderr="
+              redact_fixture_secret < "$errors" | sed -n '1,40p'
+            fi
+            if [ "$curl_code" -ne 0 ] || [ "$status" != 200 ]; then
+              fail_runtime_check "$name" "$state_dir" "$label metrics request failed"
+            fi
+            if ! grep -Eq '^(# HELP|# TYPE) ' "$body"; then
+              echo "$label format: FAIL"
+              fail_runtime_check "$name" "$state_dir" "$label response is not Prometheus text"
+            fi
+            echo "$label format: PASS"
+            for metric in openclaw_gateway_build_info openclaw_memory_bytes; do
+              if grep -q "^${metric}" "$body"; then
+                echo "metric $metric: PASS"
+              else
+                echo "metric $metric: FAIL"
+                echo "$label observed OpenClaw metric names="
+                grep -E '^(# TYPE )?openclaw_' "$body" | sed -n '1,80p' || true
+                fail_runtime_check "$name" "$state_dir" "missing metric $metric from $label response"
+              fi
+            done
+          }
+
           wait_for_startup() {
             local name="$1"
             local port="$2"
@@ -219,17 +295,34 @@ jobs:
             --volume "$state:/home/node/.openclaw" "$IMAGE"
           wait_for_startup metrics-gateway-1 3000 "$state"
 
+          public_headers="$RUNNER_TEMP/public-route.headers"
+          public_body="$RUNNER_TEMP/public-route.body"
+          public_errors="$RUNNER_TEMP/public-route.errors"
+          : > "$public_body"
+          : > "$public_headers"
+          : > "$public_errors"
+          set +e
           public_status="$(curl --silent --show-error \
-            --output "$RUNNER_TEMP/public-route.body" \
+            --dump-header "$public_headers" \
+            --output "$public_body" \
             --write-out '%{http_code}' \
+            --header 'Accept: application/json' \
             --header "Authorization: Bearer $token" \
-            http://127.0.0.1:3000/api/diagnostics/prometheus || true)"
-          test "$public_status" = 404
+            http://127.0.0.1:3000/api/diagnostics/prometheus 2>"$public_errors")"
+          public_curl_code=$?
+          set -e
+          echo "public diagnostics: curl_exit=$public_curl_code status=${public_status:-<none>}"
+          print_response "public diagnostics" "$public_headers" "$public_body"
+          if [ -s "$public_errors" ]; then
+            echo 'public diagnostics stderr='
+            redact_fixture_secret < "$public_errors" | sed -n '1,40p'
+          fi
+          if [ "$public_curl_code" -ne 0 ] || [ "$public_status" != 404 ]; then
+            fail_runtime_check metrics-gateway-1 "$state" "public diagnostics route expected HTTP 404"
+          fi
+          echo 'public diagnostics: PASS'
 
-          curl --fail --silent --show-error \
-            http://127.0.0.1:9091/metrics > "$RUNNER_TEMP/metrics-first.txt"
-          grep -q '^openclaw_gateway_build_info' "$RUNNER_TEMP/metrics-first.txt"
-          grep -q '^openclaw_memory_bytes' "$RUNNER_TEMP/metrics-first.txt"
+          check_metrics_endpoint metrics-gateway-1 9091 "$state" metrics-first
           docker stop metrics-gateway-1 >/dev/null
           docker rm metrics-gateway-1 >/dev/null
 
@@ -239,13 +332,21 @@ jobs:
             --publish 127.0.0.1:9091:9091 \
             --volume "$state:/home/node/.openclaw" "$IMAGE"
           wait_for_startup metrics-gateway-2 3000 "$state"
-          curl --fail --silent --show-error \
-            http://127.0.0.1:9091/metrics | grep -q '^openclaw_gateway_build_info'
+          check_metrics_endpoint metrics-gateway-2 9091 "$state" metrics-restart
 
           find "$state" -type f -print0 | xargs -0 -r stat -c '%u:%g %n'
-          test -z "$(docker run --rm --entrypoint sh \
+          set +e
+          root_owned_state="$(docker run --rm --entrypoint sh \
             --volume "$state:/home/node/.openclaw" "$IMAGE" \
             -c 'find /home/node/.openclaw -type f -uid 0 -print')"
+          ownership_code=$?
+          set -e
+          if [ "$ownership_code" -ne 0 ] || [ -n "$root_owned_state" ]; then
+            echo 'state ownership: FAIL'
+            [ -n "$root_owned_state" ] && printf '%s\n' "$root_owned_state"
+            fail_runtime_check metrics-gateway-2 "$state" 'state ownership assertion failed'
+          fi
+          echo 'state ownership: PASS'
           docker stop metrics-gateway-2 >/dev/null
           docker rm metrics-gateway-2 >/dev/null
 
@@ -256,10 +357,22 @@ jobs:
           docker run --detach --name metrics-gateway-failed \
             --network container:metrics-port-conflict \
             --volume "$conflict_state:/home/node/.openclaw" "$IMAGE" >/dev/null
+          set +e
           failed_code="$(timeout 90 docker wait metrics-gateway-failed)"
-          test "$failed_code" != 0
-          docker logs metrics-gateway-failed 2>&1 | tee "$RUNNER_TEMP/failed-listener.log"
-          grep -Eiq 'EADDRINUSE|address already in use|9091' "$RUNNER_TEMP/failed-listener.log"
+          wait_code=$?
+          set -e
+          echo "conflict startup: docker_wait_exit=$wait_code container_exit=${failed_code:-<none>}"
+          if [ "$wait_code" -ne 0 ]; then
+            fail_runtime_check metrics-gateway-failed "$conflict_state" 'conflict startup wait failed or timed out'
+          fi
+          docker logs metrics-gateway-failed 2>&1 | tee "$RUNNER_TEMP/failed-listener.log" | sed -n '1,120p'
+          if [ "$failed_code" = 0 ]; then
+            fail_runtime_check metrics-gateway-failed "$conflict_state" 'conflict startup unexpectedly succeeded'
+          fi
+          if ! grep -Eiq 'EADDRINUSE|address already in use|9091' "$RUNNER_TEMP/failed-listener.log"; then
+            fail_runtime_check metrics-gateway-failed "$conflict_state" 'conflict startup lacked bind-failure evidence'
+          fi
+          echo 'conflict startup: PASS'
           docker rm metrics-gateway-failed >/dev/null
           docker stop metrics-port-conflict >/dev/null
           docker rm metrics-port-conflict >/dev/null
@@ -269,8 +382,8 @@ jobs:
             --publish 127.0.0.1:9092:9091 \
             --volume "$conflict_state:/home/node/.openclaw" "$IMAGE"
           wait_for_startup metrics-gateway-recovery 3002 "$conflict_state"
-          curl --fail --silent --show-error \
-            http://127.0.0.1:9092/metrics | grep -q '^openclaw_gateway_build_info'
+          check_metrics_endpoint metrics-gateway-recovery 9092 "$conflict_state" metrics-recovery
+          echo 'recovery: PASS'
           docker stop metrics-gateway-recovery >/dev/null
           docker rm metrics-gateway-recovery >/dev/null
 
