@@ -80,6 +80,7 @@ jobs:
           config="$RUNNER_TEMP/openclaw.json"
           conflict_state="$RUNNER_TEMP/openclaw-conflict-state"
           mkdir -p "$state" "$conflict_state"
+          sudo chown 1000:1000 "$state" "$conflict_state"
 
           cat > "$config" <<'JSON'
           {
