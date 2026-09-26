@@ -1,0 +1,223 @@
+name: OpenClaw metrics image validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_registry:
+        description: Push the already-validated image to the Fly registry
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SOURCE_SHA: 7d59c003d7951d9e5c187c1eaf3de4a2ce633abf
+      OPENCLAW_VERSION: 2026.9.6
+      IMAGE: openclaw-metrics-validation:${{ github.run_id }}
+
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 7d59c003d7951d9e5c187c1eaf3de4a2ce633abf
+          fetch-depth: 1
+
+      - name: Verify source and runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(node -p "require('./package.json').version")" = "$OPENCLAW_VERSION"
+          echo '--- runner memory ---'
+          free -h
+          echo '--- runner disk ---'
+          df -h /
+          echo '--- runner CPUs ---'
+          nproc
+
+      - name: Build complete image
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_BUILDKIT=1
+          build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "BUILD_TIMESTAMP=$build_timestamp" >> "$GITHUB_ENV"
+          set -o pipefail
+          docker buildx build \
+            --load \
+            --platform linux/amd64 \
+            --progress=plain \
+            --build-arg "OPENCLAW_EXTENSIONS=diagnostics-prometheus" \
+            --build-arg "GIT_COMMIT=$SOURCE_SHA" \
+            --build-arg "OPENCLAW_BUILD_TIMESTAMP=$build_timestamp" \
+            --build-arg "OPENCLAW_DOCKER_BUILD_VERSION=$OPENCLAW_VERSION" \
+            --tag "$IMAGE" \
+            . 2>&1 | tee "$RUNNER_TEMP/openclaw-docker-build.log"
+          grep -F 'check-package-dist-imports.mjs /app' "$RUNNER_TEMP/openclaw-docker-build.log"
+
+      - name: Record local image identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE" --format \
+            'image_id={{.Id}} architecture={{.Architecture}} os={{.Os}} size_bytes={{.Size}}' \
+            | tee "$RUNNER_TEMP/openclaw-image-identity.txt"
+          cat "$RUNNER_TEMP/openclaw-image-identity.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate isolated runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          token='fixture-only-gateway-token-20260926'
+          state="$RUNNER_TEMP/openclaw-state"
+          config="$RUNNER_TEMP/openclaw.json"
+          conflict_state="$RUNNER_TEMP/openclaw-conflict-state"
+          mkdir -p "$state" "$conflict_state"
+
+          cat > "$config" <<'JSON'
+          {
+            "gateway": {
+              "mode": "local",
+              "bind": "lan",
+              "port": 3000,
+              "auth": {
+                "mode": "token",
+                "token": "fixture-only-gateway-token-20260926"
+              }
+            },
+            "diagnostics": { "enabled": true },
+            "plugins": {
+              "entries": {
+                "diagnostics-prometheus": {
+                  "enabled": true,
+                  "config": {
+                    "gatewayRoute": false,
+                    "privateListener": {
+                      "host": "0.0.0.0",
+                      "port": 9091,
+                      "path": "/metrics"
+                    }
+                  }
+                }
+              }
+            }
+          }
+          JSON
+
+          write_config() {
+            local target="$1"
+            docker run --rm -i --entrypoint sh \
+              --volume "$target:/home/node/.openclaw" "$IMAGE" \
+              -c 'cat > /home/node/.openclaw/openclaw.json' < "$config"
+          }
+
+          cleanup() {
+            docker rm -f metrics-gateway-1 metrics-gateway-2 metrics-gateway-recovery \
+              metrics-port-conflict metrics-gateway-failed >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          wait_for_startup() {
+            local name="$1"
+            local port="$2"
+            for _ in $(seq 1 90); do
+              if curl --fail --silent --show-error \
+                "http://127.0.0.1:$port/startupz" >/dev/null; then
+                return 0
+              fi
+              if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" != true ]; then
+                docker logs "$name"
+                return 1
+              fi
+              sleep 2
+            done
+            docker logs "$name"
+            return 1
+          }
+
+          write_config "$state"
+          docker run --detach --name metrics-gateway-1 \
+            --publish 127.0.0.1:3000:3000 \
+            --publish 127.0.0.1:9091:9091 \
+            --volume "$state:/home/node/.openclaw" "$IMAGE"
+          wait_for_startup metrics-gateway-1 3000
+
+          public_status="$(curl --silent --show-error \
+            --output "$RUNNER_TEMP/public-route.body" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $token" \
+            http://127.0.0.1:3000/api/diagnostics/prometheus || true)"
+          test "$public_status" = 404
+
+          curl --fail --silent --show-error \
+            http://127.0.0.1:9091/metrics > "$RUNNER_TEMP/metrics-first.txt"
+          grep -q '^openclaw_gateway_build_info' "$RUNNER_TEMP/metrics-first.txt"
+          grep -q '^openclaw_memory_bytes' "$RUNNER_TEMP/metrics-first.txt"
+          docker stop metrics-gateway-1 >/dev/null
+          docker rm metrics-gateway-1 >/dev/null
+
+          write_config "$state"
+          docker run --detach --name metrics-gateway-2 \
+            --publish 127.0.0.1:3000:3000 \
+            --publish 127.0.0.1:9091:9091 \
+            --volume "$state:/home/node/.openclaw" "$IMAGE"
+          wait_for_startup metrics-gateway-2 3000
+          curl --fail --silent --show-error \
+            http://127.0.0.1:9091/metrics | grep -q '^openclaw_gateway_build_info'
+
+          find "$state" -type f -print0 | xargs -0 -r stat -c '%u:%g %n'
+          test -z "$(docker run --rm --entrypoint sh \
+            --volume "$state:/home/node/.openclaw" "$IMAGE" \
+            -c 'find /home/node/.openclaw -type f -uid 0 -print')"
+          docker stop metrics-gateway-2 >/dev/null
+          docker rm metrics-gateway-2 >/dev/null
+
+          write_config "$conflict_state"
+          docker run --detach --name metrics-port-conflict "$IMAGE" \
+            node -e 'require("node:net").createServer().listen(9091, "0.0.0.0")' >/dev/null
+          sleep 2
+          docker run --detach --name metrics-gateway-failed \
+            --network container:metrics-port-conflict \
+            --volume "$conflict_state:/home/node/.openclaw" "$IMAGE" >/dev/null
+          failed_code="$(timeout 90 docker wait metrics-gateway-failed)"
+          test "$failed_code" != 0
+          docker logs metrics-gateway-failed 2>&1 | tee "$RUNNER_TEMP/failed-listener.log"
+          grep -Eiq 'EADDRINUSE|address already in use|9091' "$RUNNER_TEMP/failed-listener.log"
+          docker rm metrics-gateway-failed >/dev/null
+          docker stop metrics-port-conflict >/dev/null
+          docker rm metrics-port-conflict >/dev/null
+
+          docker run --detach --name metrics-gateway-recovery \
+            --publish 127.0.0.1:3002:3000 \
+            --publish 127.0.0.1:9092:9091 \
+            --volume "$conflict_state:/home/node/.openclaw" "$IMAGE"
+          wait_for_startup metrics-gateway-recovery 3002
+          curl --fail --silent --show-error \
+            http://127.0.0.1:9092/metrics | grep -q '^openclaw_gateway_build_info'
+          docker stop metrics-gateway-recovery >/dev/null
+          docker rm metrics-gateway-recovery >/dev/null
+
+      - name: Push validated image to Fly registry
+        if: ${{ inputs.push_registry }}
+        shell: bash
+        env:
+          FLY_DEPLOY_TOKEN: ${{ secrets.JORDAN_OPENCLAW_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$FLY_DEPLOY_TOKEN"
+          target='registry.fly.io/jordan-openclaw:metrics-v2026.9.6-7d59c003'
+          cleanup() { docker logout registry.fly.io >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          printf '%s' "$FLY_DEPLOY_TOKEN" | docker login registry.fly.io \
+            --username x --password-stdin >/dev/null
+          docker tag "$IMAGE" "$target"
+          docker push "$target"
+          docker buildx imagetools inspect "$target" | tee "$RUNNER_TEMP/fly-image-digest.txt"
+          cat "$RUNNER_TEMP/fly-image-digest.txt" >> "$GITHUB_STEP_SUMMARY"
