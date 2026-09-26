@@ -125,21 +125,90 @@ jobs:
           }
           trap cleanup EXIT
 
+          redact_fixture_secret() {
+            sed "s/${token}/[REDACTED]/g"
+          }
+
+          probe_endpoint() {
+            local name="$1"
+            local port="$2"
+            local path="$3"
+            local attempt="$4"
+            local prefix="$RUNNER_TEMP/${name}-${path#/}-${attempt}"
+            local body="$prefix.body"
+            local headers="$prefix.headers"
+            local errors="$prefix.errors"
+            local status
+            local curl_code
+
+            set +e
+            status="$(curl --silent --show-error \
+              --dump-header "$headers" \
+              --output "$body" \
+              --write-out '%{http_code}' \
+              "http://127.0.0.1:$port/$path" 2>"$errors")"
+            curl_code=$?
+            set -e
+
+            if [ "$curl_code" -ne 0 ]; then
+              echo "probe=$path attempt=$attempt result=curl_exit_$curl_code"
+            else
+              echo "probe=$path attempt=$attempt status=$status"
+            fi
+            if [ -s "$headers" ]; then
+              echo "probe=$path headers="
+              redact_fixture_secret < "$headers" | sed -n '1,40p'
+            fi
+            if [ -s "$body" ]; then
+              echo "probe=$path body="
+              redact_fixture_secret < "$body" | sed -n '1,80p'
+            fi
+            if [ -s "$errors" ]; then
+              echo "probe=$path stderr="
+              redact_fixture_secret < "$errors" | sed -n '1,40p'
+            fi
+
+            [ "$curl_code" -eq 0 ] && [ "$status" = 200 ]
+          }
+
+          dump_gateway_failure() {
+            local name="$1"
+            local state_dir="$2"
+            echo "--- gateway failure: $name ---"
+            docker inspect "$name" --format \
+              'status={{.State.Status}} running={{.State.Running}} exit_code={{.State.ExitCode}} error={{json .State.Error}} oom_killed={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} health={{if .State.Health}}{{json .State.Health}}{{else}}none{{end}}' \
+              2>&1 | redact_fixture_secret || true
+            echo '--- container logs ---'
+            docker logs --timestamps "$name" 2>&1 | redact_fixture_secret | sed -n '1,240p' || true
+            echo '--- state metadata ---'
+            find "$state_dir" -type f -printf '%u:%g %m %s %p\n' 2>/dev/null | sort | sed -n '1,240p' || true
+            echo '--- state log tails ---'
+            local log_file
+            local log_count=0
+            while IFS= read -r -d '' log_file; do
+              echo "### $log_file"
+              redact_fixture_secret < "$log_file" | tail -n 80
+              log_count=$((log_count + 1))
+              [ "$log_count" -ge 10 ] && break
+            done < <(find "$state_dir" -type f \( -iname '*.log' -o -iname '*.err' -o -iname '*.error' \) -print0 2>/dev/null)
+          }
+
           wait_for_startup() {
             local name="$1"
             local port="$2"
-            for _ in $(seq 1 90); do
-              if curl --fail --silent --show-error \
-                "http://127.0.0.1:$port/startupz" >/dev/null; then
+            local state_dir="$3"
+            for attempt in $(seq 1 90); do
+              if probe_endpoint "$name" "$port" startupz "$attempt"; then
                 return 0
               fi
+              probe_endpoint "$name" "$port" healthz "$attempt" || true
               if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" != true ]; then
-                docker logs "$name"
+                dump_gateway_failure "$name" "$state_dir"
                 return 1
               fi
               sleep 2
             done
-            docker logs "$name"
+            dump_gateway_failure "$name" "$state_dir"
             return 1
           }
 
@@ -148,7 +217,7 @@ jobs:
             --publish 127.0.0.1:3000:3000 \
             --publish 127.0.0.1:9091:9091 \
             --volume "$state:/home/node/.openclaw" "$IMAGE"
-          wait_for_startup metrics-gateway-1 3000
+          wait_for_startup metrics-gateway-1 3000 "$state"
 
           public_status="$(curl --silent --show-error \
             --output "$RUNNER_TEMP/public-route.body" \
@@ -169,7 +238,7 @@ jobs:
             --publish 127.0.0.1:3000:3000 \
             --publish 127.0.0.1:9091:9091 \
             --volume "$state:/home/node/.openclaw" "$IMAGE"
-          wait_for_startup metrics-gateway-2 3000
+          wait_for_startup metrics-gateway-2 3000 "$state"
           curl --fail --silent --show-error \
             http://127.0.0.1:9091/metrics | grep -q '^openclaw_gateway_build_info'
 
@@ -199,7 +268,7 @@ jobs:
             --publish 127.0.0.1:3002:3000 \
             --publish 127.0.0.1:9092:9091 \
             --volume "$conflict_state:/home/node/.openclaw" "$IMAGE"
-          wait_for_startup metrics-gateway-recovery 3002
+          wait_for_startup metrics-gateway-recovery 3002 "$conflict_state"
           curl --fail --silent --show-error \
             http://127.0.0.1:9092/metrics | grep -q '^openclaw_gateway_build_info'
           docker stop metrics-gateway-recovery >/dev/null
