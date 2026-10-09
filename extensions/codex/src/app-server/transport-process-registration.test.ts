@@ -81,6 +81,63 @@ describe("Codex process registration", () => {
     await fs.rm(root, { recursive: true, force: true });
   });
 
+  it("reaps an old registration when its reused parent PID has no process group", async () => {
+    store.register("orphan", { parent, child });
+    vi.mocked(readCodexAppServerProcessSnapshot).mockResolvedValue([
+      observer,
+      { ...parent, ppid: 1, pgid: 0, startedAt: "old-boot:54321", state: "I" },
+    ]);
+
+    await expect(prepareCodexAppServerProcessRegistration()).resolves.toBeTypeOf("function");
+
+    expect(readCodexAppServerProcessSnapshot).toHaveBeenCalledWith(
+      expect.any(Number),
+      [parent.pid, child.pid],
+      "registration-recovery",
+    );
+    expect(terminateCodexAppServerOrphan).toHaveBeenCalledExactlyOnceWith(child);
+    expect(store.lookup("orphan")).toBeUndefined();
+  });
+
+  it("drops a reused child PID without signaling the unrelated process", async () => {
+    store.register("orphan", { parent, child });
+    vi.mocked(readCodexAppServerProcessSnapshot).mockResolvedValue([
+      observer,
+      { ...parent, ppid: 1, pgid: 0, startedAt: "old-boot:54321", state: "I" },
+      { ...liveChild, pgid: 0, startedAt: "current-boot:98765", state: "I" },
+    ]);
+
+    await expect(prepareCodexAppServerProcessRegistration()).resolves.toBeTypeOf("function");
+
+    expect(terminateCodexAppServerOrphan).not.toHaveBeenCalled();
+    expect(store.lookup("orphan")).toBeUndefined();
+  });
+
+  it.for(["parent", "child"] as const)(
+    "retains a matching live %s identity when its process group is unavailable",
+    async (role) => {
+      const registration = { parent, child };
+      store.register("owned", registration);
+      const currentParent: PosixProcess = { ...parent, ppid: 1, pgid: 0, state: "S" };
+      const currentChild: PosixProcess = { ...liveChild, pgid: 0, state: "S" };
+      vi.mocked(readCodexAppServerProcessSnapshot).mockResolvedValue([
+        observer,
+        ...(role === "parent"
+          ? [currentParent]
+          : [{ ...parent, ppid: 1, startedAt: "old-boot:54321", pgid: 0, state: "I" }]),
+        ...(role === "child" ? [currentChild] : []),
+      ]);
+
+      await expect(prepareCodexAppServerProcessRegistration()).rejects.toMatchObject({
+        name: "ProcessInspectionError",
+        reason: "unavailable",
+      });
+
+      expect(store.lookup("owned")).toEqual(registration);
+      expect(terminateCodexAppServerOrphan).not.toHaveBeenCalled();
+    },
+  );
+
   it("never kills a same-second replacement process running a different command", async () => {
     store.register("orphan", { parent, child: { ...child, commandFingerprint } });
     vi.mocked(readCodexAppServerProcessCommand).mockResolvedValue("/usr/bin/unrelated-worker");

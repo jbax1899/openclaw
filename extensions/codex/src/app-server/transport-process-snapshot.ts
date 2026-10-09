@@ -78,13 +78,14 @@ function inspectionFailure(error: unknown): ProcessInspectionError {
 export async function readCodexAppServerProcessSnapshot(
   deadline = Date.now() + MAX_PROCESS_CONTAINMENT_MS,
   pids?: readonly number[],
+  operation: "direct" | "registration-recovery" = "direct",
 ): Promise<PosixProcess[]> {
   // Registration proves only known owners. Containment still needs the full tree.
   // Include the observer so an empty selected ps result cannot prove disappearance.
   const selected = pids === undefined ? undefined : [...new Set([process.pid, ...pids])];
   const rows =
     process.platform === "linux"
-      ? await readLinuxProcesses(selected, deadline)
+      ? await readLinuxProcesses(selected, deadline, operation)
       : await readProcesses(
           selected ? ["-o", PROCESS_COLUMNS, "-p", selected.join(",")] : ["-axo", PROCESS_COLUMNS],
           deadline,
@@ -278,9 +279,10 @@ function parseProcesses(output: string, selected: boolean): PosixProcess[] {
 async function readLinuxProcesses(
   selected: readonly number[] | undefined,
   deadline: number,
+  operation: "direct" | "registration-recovery" = "direct",
 ): Promise<PosixProcess[]> {
   if (selected !== undefined) {
-    return readSelectedLinuxProcesses(selected, deadline);
+    return readSelectedLinuxProcesses(selected, deadline, operation);
   }
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) {
@@ -346,6 +348,7 @@ function parseLinuxProcess(
   entry: string,
   bootId: string,
   selected: boolean,
+  allowUnusableGroupIdentity = false,
 ): PosixProcess | undefined {
   // comm can contain spaces, newlines and ')'; fields 3..N follow its last ')'.
   const commEnd = stat.lastIndexOf(")");
@@ -359,13 +362,27 @@ function parseLinuxProcess(
   if (
     commEnd < 0 ||
     ![ppid, pgid].every(Number.isSafeInteger) ||
-    (selected && (pgid <= 0 || ppid < 0)) ||
+    (selected && ((!allowUnusableGroupIdentity && pgid <= 0) || ppid < 0)) ||
     !/^\d+$/.test(startTicks ?? "")
   ) {
     throw new ProcessInspectionError("unavailable");
   }
+  // Recovery may compare a reused PID's start identity; it cannot use this row to signal it.
+  if (selected && allowUnusableGroupIdentity && Number(entry) !== process.pid && pgid <= 0) {
+    const threads = Number(fields[17]);
+    if (!/^[1-9]\d*$/.test(fields[17] ?? "") || !Number.isSafeInteger(threads)) {
+      throw new ProcessInspectionError("unavailable");
+    }
+    return {
+      pid: Number(entry),
+      ppid,
+      pgid,
+      state: `${fields[0] ?? ""}${threads > 1 ? "l" : ""}`,
+      startedAt: `${bootId}:${startTicks}`,
+    };
+  }
   // An exiting task can lose its signal lock and report pgid=-1, threads=0.
-  // Full scans omit that row; selected owners still require usable group evidence.
+  // Full scans omit that row; ordinary selected snapshots require usable group evidence.
   if (pgid > 0) {
     const threads = Number(fields[17]);
     if (!/^[1-9]\d*$/.test(fields[17] ?? "") || !Number.isSafeInteger(threads)) {
@@ -422,7 +439,11 @@ function readSelectedProcFile(
   }
 }
 
-function readSelectedLinuxProcesses(selected: readonly number[], deadline: number): PosixProcess[] {
+function readSelectedLinuxProcesses(
+  selected: readonly number[],
+  deadline: number,
+  operation: "direct" | "registration-recovery",
+): PosixProcess[] {
   try {
     const bootId = parseLinuxBootId(
       readSelectedProcFile("/proc/sys/kernel/random/boot_id", deadline).toString("utf8"),
@@ -452,7 +473,13 @@ function readSelectedLinuxProcesses(selected: readonly number[], deadline: numbe
         throw error;
       }
       bytes += stat.length;
-      const row = parseLinuxProcess(stat.toString("utf8"), entry, bootId, true);
+      const row = parseLinuxProcess(
+        stat.toString("utf8"),
+        entry,
+        bootId,
+        true,
+        operation === "registration-recovery",
+      );
       if (row) {
         rows.push(row);
       }

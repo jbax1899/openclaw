@@ -277,6 +277,74 @@ describe("Codex procfs command inspector", () => {
 });
 
 describe("Codex procfs process inspector", () => {
+  it("allows registration recovery to compare start identity without group authority", async (ctx) => {
+    ctx.onTestFinished(() => {
+      procfs.readFile.mockReset();
+      vi.restoreAllMocks();
+    });
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    const bootId = "00000000-0000-0000-0000-000000000001";
+    const reusedPid = process.pid + 1;
+    let observerGroup = process.pid;
+    procfs.readFile.mockImplementation((file) => {
+      if (file === "/proc/sys/kernel/random/boot_id") {
+        return bootId;
+      }
+      if (file === `/proc/${process.pid}/stat`) {
+        return `${process.pid} (observer) S ${process.ppid} ${observerGroup}${" 0".repeat(14)} 1 0 12345\n`;
+      }
+      expect(file).toBe(`/proc/${reusedPid}/stat`);
+      return `${reusedPid} (reused-pid) S ${process.pid} 0${" 0".repeat(14)} 1 0 54321\n`;
+    });
+
+    await expect(
+      readCodexAppServerProcessSnapshot(undefined, [reusedPid], "registration-recovery"),
+    ).resolves.toEqual([
+      expect.objectContaining({ pid: process.pid, pgid: process.pid }),
+      expect.objectContaining({ pid: reusedPid, pgid: 0, startedAt: `${bootId}:54321` }),
+    ]);
+    await expect(readCodexAppServerProcessSnapshot(undefined, [reusedPid])).rejects.toMatchObject({
+      reason: "unavailable",
+    });
+    observerGroup = 0;
+    await expect(
+      readCodexAppServerProcessSnapshot(undefined, [reusedPid], "registration-recovery"),
+    ).rejects.toMatchObject({ reason: "unavailable" });
+  });
+
+  it("preserves the non-dead classification for a groupless threaded zombie", async (ctx) => {
+    ctx.onTestFinished(() => {
+      procfs.readFile.mockReset();
+      vi.restoreAllMocks();
+    });
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    const bootId = "00000000-0000-0000-0000-000000000001";
+    const reusedPid = process.pid + 1;
+    procfs.readFile.mockImplementation((file) => {
+      if (file === "/proc/sys/kernel/random/boot_id") {
+        return bootId;
+      }
+      if (file === `/proc/${process.pid}/stat`) {
+        return `${process.pid} (observer) S ${process.ppid} ${process.pid}${" 0".repeat(14)} 1 0 12345\n`;
+      }
+      expect(file).toBe(`/proc/${reusedPid}/stat`);
+      return `${reusedPid} (reused-pid) Z ${process.pid} 0${" 0".repeat(14)} 2 0 54321\n`;
+    });
+
+    await expect(
+      readCodexAppServerProcessSnapshot(undefined, [reusedPid], "registration-recovery"),
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          pid: reusedPid,
+          pgid: 0,
+          startedAt: `${bootId}:54321`,
+          state: "Zl",
+        }),
+      ]),
+    );
+  });
+
   it.for(["command at limit", "command overflow", "snapshot overflow"])(
     "keeps selected procfs reads within the inspection byte budget: %s",
     async (mode, ctx) => {

@@ -1,0 +1,85 @@
+name: Codex stale-registration Linux validation
+
+on:
+  push:
+    branches:
+      - fix/codex-stale-registration-pid-reuse
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-stale-registration-linux-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  focused-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the pinned source change
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Verify the exact base and patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=eb377ac59e6c9fd6c7705028034812becf00271b
+          test "$(git rev-parse HEAD^)" = "$base"
+          expected=$(printf '%s\n' \
+            extensions/codex/src/app-server/transport-process-registration.test.ts \
+            extensions/codex/src/app-server/transport-process-registration.ts \
+            extensions/codex/src/app-server/transport-process-snapshot.test.ts \
+            extensions/codex/src/app-server/transport-process-snapshot.ts \
+            .github/workflows/codex-stale-registration-linux-validation.yml | LC_ALL=C sort)
+          actual=$(git diff --name-only "$base" HEAD | LC_ALL=C sort)
+          test "$actual" = "$expected"
+          git diff --check "$base" HEAD
+          git diff --exit-code "$base" HEAD -- package.json pnpm-lock.yaml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install the pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          test "$(pnpm --version)" = "12.4.0"
+          pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Run registration, procfs, and containment regression suites
+        run: >-
+          node scripts/run-vitest.mjs run
+          --config test/vitest/vitest.extension-database-workers.config.ts
+          --maxWorkers=1
+          codex/src/app-server/transport-process-registration.test.ts
+          codex/src/app-server/transport-process-registration.procfs.test.ts
+
+      - name: Run snapshot and lifecycle regression suites
+        run: >-
+          node scripts/run-vitest.mjs run
+          --config test/vitest/vitest.extension-codex-app-server-runtime.config.ts
+          --maxWorkers=1
+          codex/src/app-server/transport-process-snapshot.test.ts
+          codex/src/app-server/transport-process-registration.lifecycle.test.ts
+          codex/src/app-server/transport.process.test.ts
+
+      - name: Run extension TypeScript checks
+        run: pnpm tsgo:extensions
+
+      - name: Run extension test TypeScript checks
+        run: pnpm tsgo:extensions:test
+
+      - name: Verify formatting and patch integrity
+        run: |
+          pnpm exec oxfmt --check \
+            extensions/codex/src/app-server/transport-process-registration.test.ts \
+            extensions/codex/src/app-server/transport-process-registration.ts \
+            extensions/codex/src/app-server/transport-process-snapshot.test.ts \
+            extensions/codex/src/app-server/transport-process-snapshot.ts
+          git diff --check eb377ac59e6c9fd6c7705028034812becf00271b HEAD

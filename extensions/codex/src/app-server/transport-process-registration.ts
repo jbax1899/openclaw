@@ -84,15 +84,31 @@ async function sweepRegisteredCodexAppServerOrphans(
       throw new Error("Codex orphan cleanup exceeded its startup budget. Retry to finish cleanup.");
     }
     const registration = registrationSchema.parse(entry.value);
-    const snapshot = await readCodexAppServerProcessSnapshot(deadline, [
-      registration.parent.pid,
-      registration.child.pid,
-    ]);
+    const snapshot = await readCodexAppServerProcessSnapshot(
+      deadline,
+      [registration.parent.pid, registration.child.pid],
+      "registration-recovery",
+    );
     const parent = snapshot.find((row) => row.pid === registration.parent.pid);
     if (parent?.startedAt === registration.parent.startedAt && !isDeadProcessState(parent.state)) {
+      if (parent.pgid <= 0) {
+        throw new ProcessInspectionError("unavailable");
+      }
       continue;
     }
     const child = snapshot.find((row) => row.pid === registration.child.pid);
+    if (child?.startedAt !== registration.child.startedAt && child) {
+      // A reused PID is not ours to inspect or signal, even if it has no process group.
+      await store.delete(entry.key);
+      continue;
+    }
+    if (child?.startedAt === registration.child.startedAt && isDeadProcessState(child.state)) {
+      await store.delete(entry.key);
+      continue;
+    }
+    if (child?.startedAt === registration.child.startedAt && child.pgid <= 0) {
+      throw new ProcessInspectionError("unavailable");
+    }
     if (
       registration.child.commandFingerprint !== undefined &&
       child?.startedAt === registration.child.startedAt &&
