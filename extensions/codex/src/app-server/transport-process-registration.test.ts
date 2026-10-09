@@ -113,6 +113,38 @@ describe("Codex process registration", () => {
     expect(store.lookup("orphan")).toBeUndefined();
   });
 
+  it("retires a matching dead child when its process group is unavailable", async () => {
+    store.register("orphan", { parent, child });
+    vi.mocked(readCodexAppServerProcessSnapshot).mockResolvedValue([
+      observer,
+      { ...parent, ppid: 1, pgid: 0, startedAt: "old-boot:54321", state: "I" },
+      { ...liveChild, pgid: 0, state: "Z" },
+    ]);
+
+    await expect(prepareCodexAppServerProcessRegistration()).resolves.toBeTypeOf("function");
+
+    expect(terminateCodexAppServerOrphan).not.toHaveBeenCalled();
+    expect(store.lookup("orphan")).toBeUndefined();
+  });
+
+  it("retains a groupless threaded zombie because it is not proven dead", async () => {
+    const registration = { parent, child };
+    store.register("orphan", registration);
+    vi.mocked(readCodexAppServerProcessSnapshot).mockResolvedValue([
+      observer,
+      { ...parent, ppid: 1, pgid: 0, startedAt: "old-boot:54321", state: "I" },
+      { ...liveChild, pgid: 0, state: "Zl" },
+    ]);
+
+    await expect(prepareCodexAppServerProcessRegistration()).rejects.toMatchObject({
+      name: "ProcessInspectionError",
+      reason: "unavailable",
+    });
+
+    expect(store.lookup("orphan")).toEqual(registration);
+    expect(terminateCodexAppServerOrphan).not.toHaveBeenCalled();
+  });
+
   it.for(["parent", "child"] as const)(
     "retains a matching live %s identity when its process group is unavailable",
     async (role) => {

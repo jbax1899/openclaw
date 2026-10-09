@@ -97,16 +97,16 @@ async function sweepRegisteredCodexAppServerOrphans(
       continue;
     }
     const child = snapshot.find((row) => row.pid === registration.child.pid);
-    if (child?.startedAt !== registration.child.startedAt && child) {
+    if (child && child.startedAt !== registration.child.startedAt && child.pgid <= 0) {
       // A reused PID is not ours to inspect or signal, even if it has no process group.
       await store.delete(entry.key);
       continue;
     }
-    if (child?.startedAt === registration.child.startedAt && isDeadProcessState(child.state)) {
-      await store.delete(entry.key);
-      continue;
-    }
     if (child?.startedAt === registration.child.startedAt && child.pgid <= 0) {
+      if (isDeadProcessState(child.state)) {
+        await store.delete(entry.key);
+        continue;
+      }
       throw new ProcessInspectionError("unavailable");
     }
     if (
