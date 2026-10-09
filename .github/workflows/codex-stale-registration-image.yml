@@ -1,0 +1,194 @@
+name: Build validated Codex stale-registration image
+
+on:
+  push:
+    branches:
+      - build/codex-stale-registration-eb377ac
+
+permissions: {}
+
+concurrency:
+  group: codex-stale-registration-image-build
+  cancel-in-progress: false
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: e755d884e879a7f9107fe7ce200946d04d0a7c3e
+      BASE_SHA: eb377ac59e6c9fd6c7705028034812becf00271b
+      LOCAL_IMAGE: openclaw-codex-candidate:e755d884e879a7f9107fe7ce200946d04d0a7c3e
+    steps:
+      - name: Check out the exact validated source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: e755d884e879a7f9107fe7ce200946d04d0a7c3e
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source ancestry and exact change scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C source fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git -C source cat-file -e "$BASE_SHA^{commit}"
+          expected=$(cat <<'EOF'
+          .github/workflows/codex-stale-registration-linux-validation.yml
+          extensions/codex/src/app-server/transport-process-registration.test.ts
+          extensions/codex/src/app-server/transport-process-registration.ts
+          extensions/codex/src/app-server/transport-process-snapshot.test.ts
+          extensions/codex/src/app-server/transport-process-snapshot.ts
+          EOF
+          )
+          actual=$(git -C source diff --name-only "$BASE_SHA" "$SOURCE_SHA")
+          test "$actual" = "$expected"
+          echo "Source: $SOURCE_SHA"
+          echo "Production changes: transport-process-registration.ts and transport-process-snapshot.ts"
+          echo "Other cumulative files are focused tests and the isolated validation workflow."
+
+      - name: Check runner capacity before building
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat /proc/meminfo | grep -E '^(MemTotal|MemAvailable):'
+          df -h /
+          mem_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          free_kib=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if (( mem_kib < 12582912 )); then
+            echo "Ubuntu runner has less than 12 GiB RAM; refusing this image build." >&2
+            exit 1
+          fi
+          if (( free_kib < 8388608 )); then
+            echo "Ubuntu runner has less than 8 GiB free disk; refusing this image build." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Record image build metadata
+        id: build-meta
+        shell: bash
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the complete Linux AMD64 runtime image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: source
+          platforms: linux/amd64
+          load: true
+          tags: openclaw-codex-candidate:e755d884e879a7f9107fe7ce200946d04d0a7c3e
+          build-args: |
+            GIT_COMMIT=e755d884e879a7f9107fe7ce200946d04d0a7c3e
+            OPENCLAW_BUILD_TIMESTAMP=${{ steps.build-meta.outputs.created }}
+            OPENCLAW_DOCKER_BUILD_VERSION=2026.9.6
+            OPENCLAW_EXTENSIONS=diagnostics-otel,codex
+          labels: |
+            org.opencontainers.image.revision=e755d884e879a7f9107fe7ce200946d04d0a7c3e
+            org.opencontainers.image.version=2026.9.6
+            org.opencontainers.image.created=${{ steps.build-meta.outputs.created }}
+
+      - name: Verify architecture, revision, Codex plugin, and repair payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$LOCAL_IMAGE")" = "linux/amd64"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$LOCAL_IMAGE")" = "$SOURCE_SHA"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")" = "2026.9.6"
+          docker run --rm --network none --entrypoint node "$LOCAL_IMAGE" --input-type=module -e 'await import("./dist/extensions/codex/index.js")'
+          docker run --rm --network none --entrypoint sh "$LOCAL_IMAGE" -ec 'test -d /app/dist/extensions/codex && grep -Rqs --include="*.js" "registration-recovery" /app/dist/extensions/codex'
+          docker run --rm --network none "$LOCAL_IMAGE" node openclaw.mjs --version
+
+      - name: Start and health-check a disposable isolated Gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() { docker rm -f openclaw-image-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run --detach --name openclaw-image-smoke --network none \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --env OPENCLAW_STATE_DIR=/tmp/openclaw-state \
+            "$LOCAL_IMAGE" node openclaw.mjs gateway --allow-unconfigured --bind loopback --port 18789
+          for attempt in $(seq 1 30); do
+            running=$(docker inspect --format '{{.State.Running}}' openclaw-image-smoke 2>/dev/null || true)
+            if [[ "$running" != "true" ]]; then
+              echo "Disposable Gateway exited before health became ready." >&2
+              docker logs --tail 40 openclaw-image-smoke >&2 || true
+              exit 1
+            fi
+            if docker exec openclaw-image-smoke node --input-type=module -e 'const response = await fetch("http://127.0.0.1:18789/startupz"); if (!response.ok) process.exit(1)' >/dev/null 2>&1; then
+              echo "Disposable Gateway startup health passed."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Disposable Gateway did not become healthy within 30 seconds." >&2
+          docker logs --tail 40 openclaw-image-smoke >&2 || true
+          exit 1
+
+      - name: Seal the tested image for the isolated publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/openclaw-image"
+          docker save "$LOCAL_IMAGE" -o "$RUNNER_TEMP/openclaw-image/image.tar"
+          cd "$RUNNER_TEMP/openclaw-image"
+          sha256sum image.tar > image.tar.sha256
+
+      - name: Upload sealed image to this workflow run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-codex-stale-registration-e755d884e879a7f9107fe7ce200946d04d0a7c3e
+          path: ${{ runner.temp }}/openclaw-image/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build-and-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: fix-eb377ac-e755d884e879a7f9107fe7ce200946d04d0a7c3e
+    steps:
+      - name: Download the tested immutable image archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: openclaw-codex-stale-registration-e755d884e879a7f9107fe7ce200946d04d0a7c3e
+          path: ${{ runner.temp }}/openclaw-image/
+
+      - name: Verify archive and publish the pinned image tag to GHCR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/openclaw-image"
+          sha256sum --check image.tar.sha256
+          docker load --input image.tar
+          docker tag openclaw-codex-candidate:e755d884e879a7f9107fe7ce200946d04d0a7c3e "$IMAGE_NAME:$IMAGE_TAG"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          digest_ref=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE_NAME:$IMAGE_TAG" | grep -F "$IMAGE_NAME@" | head -n 1)
+          digest=$(printf '%s' "$digest_ref" | sed 's/.*@//')
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker pull "$IMAGE_NAME@$digest"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_NAME@$digest")" = "linux/amd64"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE_NAME@$digest")" = "e755d884e879a7f9107fe7ce200946d04d0a7c3e"
+          {
+            echo "### Immutable OpenClaw candidate"
+            echo
+            echo "- Source: e755d884e879a7f9107fe7ce200946d04d0a7c3e"
+            echo "- Tag: $IMAGE_NAME:$IMAGE_TAG"
+            echo "- Digest reference: $IMAGE_NAME@$digest"
+            echo "- Platform: linux/amd64"
+          } >> "$GITHUB_STEP_SUMMARY"
