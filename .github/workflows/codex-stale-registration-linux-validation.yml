@@ -27,7 +27,8 @@ jobs:
         run: |
           set -euo pipefail
           base=eb377ac59e6c9fd6c7705028034812becf00271b
-          test "$(git rev-parse HEAD^)" = "$base"
+          git fetch --no-tags --depth=1 origin "$base"
+          git cat-file -e "$base^{commit}"
           expected=$(printf '%s\n' \
             extensions/codex/src/app-server/transport-process-registration.test.ts \
             extensions/codex/src/app-server/transport-process-registration.ts \
