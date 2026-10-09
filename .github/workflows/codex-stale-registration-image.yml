@@ -93,16 +93,49 @@ jobs:
             org.opencontainers.image.version=2026.9.6
             org.opencontainers.image.created=${{ steps.build-meta.outputs.created }}
 
-      - name: Verify architecture, revision, Codex plugin, and repair payload
+      - name: Verify image platform and source labels
         shell: bash
         run: |
           set -euo pipefail
-          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$LOCAL_IMAGE")" = "linux/amd64"
-          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$LOCAL_IMAGE")" = "$SOURCE_SHA"
-          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")" = "2026.9.6"
+          architecture="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$LOCAL_IMAGE")"
+          revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$LOCAL_IMAGE")"
+          version_label="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
+          printf 'Architecture: %s\nRevision: %s\nVersion label: %s\n' "$architecture" "$revision" "$version_label"
+          test "$architecture" = "linux/amd64"
+          test "$revision" = "$SOURCE_SHA"
+          test "$version_label" = "2026.9.6"
+
+      - name: Verify Codex plugin package import
+        shell: bash
+        run: |
+          set -euo pipefail
           docker run --rm --network none --entrypoint node "$LOCAL_IMAGE" --input-type=module -e 'await import("./dist/extensions/codex/index.js")'
-          docker run --rm --network none --entrypoint sh "$LOCAL_IMAGE" -ec 'test -d /app/dist/extensions/codex && grep -Rqs --include="*.js" "registration-recovery" /app/dist/extensions/codex'
-          docker run --rm --network none "$LOCAL_IMAGE" node openclaw.mjs --version
+          echo "Codex plugin package imports successfully."
+
+      - name: Verify repaired process-registration payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint sh "$LOCAL_IMAGE" -ec '
+            if ! test -d /app/dist/extensions/codex; then
+              echo "Expected Codex runtime directory is missing." >&2
+              exit 1
+            fi
+            if ! grep -Rqs --include="*.js" "registration-recovery" /app/dist/extensions/codex; then
+              echo "Registration recovery marker is missing from the compiled Codex runtime." >&2
+              find /app/dist/extensions/codex -maxdepth 4 -type f | head -n 20 >&2
+              exit 1
+            fi
+          '
+          echo "Registration recovery marker is present in the compiled Codex runtime."
+
+      - name: Verify OpenClaw runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_version="$(docker run --rm --network none "$LOCAL_IMAGE" node openclaw.mjs --version)"
+          printf 'Runtime version: %s\n' "$runtime_version"
+          grep -Fq "2026.9.6" <<< "$runtime_version"
 
       - name: Start and health-check a disposable isolated Gateway
         shell: bash
