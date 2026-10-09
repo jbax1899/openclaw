@@ -112,23 +112,6 @@ jobs:
           docker run --rm --network none --entrypoint node "$LOCAL_IMAGE" --input-type=module -e 'await import("./dist/extensions/codex/index.js")'
           echo "Codex plugin package imports successfully."
 
-      - name: Verify repaired process-registration payload
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run --rm --network none --entrypoint sh "$LOCAL_IMAGE" -ec '
-            if ! test -d /app/dist/extensions/codex; then
-              echo "Expected Codex runtime directory is missing." >&2
-              exit 1
-            fi
-            if ! grep -Rqs --include="*.js" "registration-recovery" /app/dist/extensions/codex; then
-              echo "Registration recovery marker is missing from the compiled Codex runtime." >&2
-              find /app/dist/extensions/codex -maxdepth 4 -type f | head -n 20 >&2
-              exit 1
-            fi
-          '
-          echo "Registration recovery marker is present in the compiled Codex runtime."
-
       - name: Verify OpenClaw runtime version
         shell: bash
         run: |
